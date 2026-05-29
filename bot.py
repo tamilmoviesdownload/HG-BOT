@@ -20,7 +20,7 @@ except ImportError:
 
 from pyrogram import types, Client, StopPropagation
 from pyrogram.handlers import MessageHandler
-from pyrogram.errors import FloodWait
+from pyrogram.errors import FloodWait, TokenInvalid
 from aiohttp import web
 from typing import Union, Optional, AsyncGenerator
 
@@ -29,18 +29,24 @@ from info import URL, INDEX_CHANNELS, SUPPORT_GROUP, LOG_CHANNEL, API_ID, DATA_D
 from utils import temp, get_readable_time, check_premium
 from database.users_chats_db import db
 from database.ia_filterdb import setup_database
+from plugins.clone_db import clone_db  # Imported database script for tracking clones
 
 if ul:
     uvloop.install()
 
-class Bot(Client):
+# Dictionary to hold running clone bot instances in memory
+# Key: bot_token, Value: Pyrogram Client object
+running_clones = {}
+
+class MasterBot(Client):
     def __init__(self):
         super().__init__(
             name='Auto_Filter_Bot',
             api_id=API_ID,
             api_hash=API_HASH,
             bot_token=BOT_TOKEN,
-            plugins={"root": "plugins"}
+            workers=200,
+            plugins={"root": "plugins"} # Loads all handlers globally
         )
         self.listeners = {}
         self.add_handler(MessageHandler(self._listener_handler), group=-1)
@@ -79,6 +85,8 @@ class Bot(Client):
         logger.info('Setting up your database, please wait a moment...')
         await setup_database()
         logger.info('Successfully setup the database!')
+        
+        # Start Master Bot Client
         await super().start()
         temp.START_TIME = time.time()
         b_users, b_chats = await db.get_banned()
@@ -100,19 +108,80 @@ class Bot(Client):
         temp.U_NAME = me.username
         temp.B_NAME = me.first_name
         
-        app = web.AppRunner(web_app)
-        await app.setup()
-        await web.TCPSite(app, "0.0.0.0", PORT).start()
+        # Setup Web Server
+        app_runner = web.AppRunner(web_app)
+        await app_runner.setup()
+        await web.TCPSite(app_runner, "0.0.0.0", PORT).start()
 
+        # Background automation task
         asyncio.create_task(check_premium(self))
+        
         try:
             await self.send_message(chat_id=LOG_CHANNEL, text=f"<b>{me.mention} Restarted! 🤖</b>")
         except:
             logger.error("Make sure bot admin in LOG_CHANNEL, exiting now")
             exit()
-        logger.info(f"Bot [@{me.username}] and webapp [{URL}] is started now ✓")
+            
+        logger.info(f"🔥 Master Bot [@{me.username}] and webapp [{URL}] started successfully ✓")
+
+        # ---- Dynamic Clone Initialization Block ----
+        all_clones = await clone_db.get_all_clones()
+        logger.info(f"Found {len(all_clones)} subscriber clones in database. Initializing execution loops...")
+
+        for clone in all_clones:
+            token = clone['bot_token']
+            asyncio.create_task(self.start_clone_instance(token))
+
+    async def start_clone_instance(self, token: str) -> bool:
+        """Spawns an independent runner client for a subscriber bot token."""
+        if token in running_clones:
+            return False
+            
+        # Create unique session string for each clone to avoid lock conflicts
+        session_name = f"clone_{token.split(':')[0]}"
+        
+        # Instantiate clone client utilizing the SAME global plugin blueprints
+        clone_app = Client(
+            name=session_name,
+            api_id=API_ID,
+            api_hash=API_HASH,
+            bot_token=token,
+            workers=50,
+            plugins={"root": "plugins"} # Shares structural parsing hooks instantly
+        )
+        
+        try:
+            await clone_app.start()
+            clone_me = await clone_app.get_me()
+            running_clones[token] = clone_app
+            logger.info(f"✅ Clone Launched Successfully: @{clone_me.username}")
+            return True
+        except TokenInvalid:
+            logger.error(f"❌ Revoked/Invalid subscriber token found: {token}. Removing entry.")
+            await clone_db.remove_clone(token)
+            return False
+        except Exception as e:
+            logger.error(f"⚠️ Failed to spin up clone {token}: {str(e)}")
+            return False
+
+    async def stop_clone_instance(self, token: str) -> bool:
+        """Gracefully removes a clone out of server memory execution."""
+        if token in running_clones:
+            try:
+                await running_clones[token].stop()
+                del running_clones[token]
+                logger.info(f"🛑 Clone stopped and removed from memory loop: {token.split(':')[0]}")
+                return True
+            except Exception as e:
+                logger.error(f"Error stopping clone loop: {e}")
+        return False
 
     async def stop(self, **kwargs):
+        # Gracefully shut down all running clones first
+        logger.info("Stopping all active subscriber clones...")
+        for token in list(running_clones.keys()):
+            await self.stop_clone_instance(token)
+            
         await super().stop()
         logger.info("Bot Stopped! Bye...")
 
@@ -127,5 +196,6 @@ class Bot(Client):
                 yield message
                 current += 1
 
-app = Bot()
-app.run()
+if __name__ == "__main__":
+    master_engine = MasterBot()
+    master_engine.run()
